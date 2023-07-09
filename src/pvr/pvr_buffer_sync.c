@@ -185,8 +185,8 @@ pvr_buffer_sync_pmrs_fence_count(u32 nr_pmrs, struct _PMR_ **pmrs,
 				 u32 *pmr_flags)
 {
 	struct dma_resv *resv;
-	struct dma_resv_list *resv_list;
 	struct dma_fence *fence;
+	struct dma_resv_iter cursor;
 	u32 fence_count = 0;
 	bool exclusive;
 	int i;
@@ -198,15 +198,27 @@ pvr_buffer_sync_pmrs_fence_count(u32 nr_pmrs, struct _PMR_ **pmrs,
 		if (WARN_ON_ONCE(!resv))
 			continue;
 
-		resv_list = dma_resv_shared_list(resv);
-		fence = dma_resv_excl_fence(resv);
+		/* Count the number of shared fences first */
+		u32 shared_count = 0;
+		dma_resv_iter_begin(&cursor, resv, DMA_RESV_USAGE_READ);
+		dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_READ, fence) {
+			shared_count++;
+		}
+		dma_resv_iter_end(&cursor);
 
-		if (fence &&
-		    (!exclusive || !resv_list || !resv_list->shared_count))
-			fence_count++;
+		/* Now find the exclusive fence. Increase the final fence count
+		 * only if the exclusive flag is NOT set or if there is no shared fence. */
+		dma_resv_iter_begin(&cursor, resv, DMA_RESV_USAGE_WRITE);
+		dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_WRITE, fence) {
+			if (!exclusive || !shared_count) {
+				fence_count++;
+			}
+		}
+		dma_resv_iter_end(&cursor);
 
-		if (exclusive && resv_list)
-			fence_count += resv_list->shared_count;
+		/* Otherwise, increase the final fence count by the number of shared fences */
+		if (exclusive)
+			fence_count += shared_count;
 	}
 
 	return fence_count;
@@ -221,11 +233,11 @@ pvr_buffer_sync_check_fences_create(struct pvr_fence_context *fence_ctx,
 {
 	struct pvr_buffer_sync_check_data *data;
 	struct dma_resv *resv;
-	struct dma_resv_list *resv_list;
 	struct dma_fence *fence;
+	struct dma_resv_iter cursor;
 	u32 fence_count;
 	bool exclusive;
-	int i, j;
+	int i;
 	int err;
 
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
@@ -248,42 +260,44 @@ pvr_buffer_sync_check_fences_create(struct pvr_fence_context *fence_ctx,
 
 		exclusive = !!(pmr_flags[i] & PVR_BUFFER_FLAG_WRITE);
 		if (!exclusive) {
-			err = dma_resv_reserve_shared(resv
-#if defined(OS_FUNC_DMA_RESV_RESERVE_SHARED_EXIST)
-						      , 1
-#else
-#if defined(OS_RESERVATION_OBJECT_RESERVE_SHARED_HAS_NUM_FENCES_ARG)
-						      , 1
-#endif
-#endif
-				);
+			err = dma_resv_reserve_fences(resv, 1);
 			if (err)
 				goto err_destroy_fences;
 		}
 
-		resv_list = dma_resv_shared_list(resv);
-		fence = dma_resv_excl_fence(resv);
+		/* Count the number of shared fences first */
+		u32 shared_count = 0;
+		dma_resv_iter_begin(&cursor, resv, DMA_RESV_USAGE_READ);
+		dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_READ, fence) {
+			shared_count++;
+		}
+		dma_resv_iter_end(&cursor);
 
-		if (fence &&
-		    (!exclusive || !resv_list || !resv_list->shared_count)) {
-			data->fences[data->nr_fences++] =
-				pvr_fence_create_from_fence(fence_ctx,
-							    sync_checkpoint_ctx,
-							    fence,
-							    PVRSRV_NO_FENCE,
-							    "exclusive check fence");
-			if (!data->fences[data->nr_fences - 1]) {
-				data->nr_fences--;
-				PVR_FENCE_TRACE(fence,
-						"waiting on exclusive fence\n");
-				WARN_ON(dma_fence_wait(fence, true) <= 0);
+		/* Now find the exclusive fence. Create the exclusive check fence
+		 * only if the exclusive flag is NOT set or if there is no shared fence. */
+		dma_resv_iter_begin(&cursor, resv, DMA_RESV_USAGE_WRITE);
+		dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_WRITE, fence) {
+			if (!exclusive || !shared_count) {
+				data->fences[data->nr_fences++] =
+					pvr_fence_create_from_fence(fence_ctx,
+								    sync_checkpoint_ctx,
+								    fence,
+								    PVRSRV_NO_FENCE,
+								    "exclusive check fence");
+				if (!data->fences[data->nr_fences - 1]) {
+					data->nr_fences--;
+					PVR_FENCE_TRACE(fence,
+							"waiting on exclusive fence\n");
+					WARN_ON(dma_fence_wait(fence, true) <= 0);
+				}
 			}
 		}
+		dma_resv_iter_end(&cursor);
 
-		if (exclusive && resv_list) {
-			for (j = 0; j < resv_list->shared_count; j++) {
-				fence = rcu_dereference_protected(resv_list->shared[j],
-								  dma_resv_held(resv));
+		/* Otherwise, create shared check fences */
+		if (exclusive) {
+			dma_resv_iter_begin(&cursor, resv, DMA_RESV_USAGE_READ);
+			dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_READ, fence) {
 				data->fences[data->nr_fences++] =
 					pvr_fence_create_from_fence(fence_ctx,
 								    sync_checkpoint_ctx,
@@ -297,6 +311,7 @@ pvr_buffer_sync_check_fences_create(struct pvr_fence_context *fence_ctx,
 					WARN_ON(dma_fence_wait(fence, true) <= 0);
 				}
 			}
+			dma_resv_iter_end(&cursor);
 		}
 	}
 
@@ -543,14 +558,16 @@ pvr_buffer_sync_kick_succeeded(struct pvr_buffer_sync_append_data *data)
 			PVR_FENCE_TRACE(&data->update_fence->base,
 					"added exclusive fence (%s) to resv %p\n",
 					data->update_fence->name, resv);
-			dma_resv_add_excl_fence(resv,
-						&data->update_fence->base);
+			dma_resv_add_fence(resv,
+					   &data->update_fence->base,
+					   DMA_RESV_USAGE_WRITE);
 		} else if (data->pmr_flags[i] & PVR_BUFFER_FLAG_READ) {
 			PVR_FENCE_TRACE(&data->update_fence->base,
 					"added non-exclusive fence (%s) to resv %p\n",
 					data->update_fence->name, resv);
-			dma_resv_add_shared_fence(resv,
-						  &data->update_fence->base);
+			dma_resv_add_fence(resv,
+					   &data->update_fence->base,
+					   DMA_RESV_USAGE_READ);
 		}
 	}
 
